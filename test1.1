@@ -1,0 +1,156 @@
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.optimize import minimize
+from scipy.spatial.distance import cdist
+
+# --------------------------
+# 1. 複雑な真の関数を定義
+# --------------------------
+def true_function(X):
+    """
+    例として、以下の比較的複雑な関数を使用:
+      f(x) = 0.5*sin(3x) + 0.05*x^2 - cos(2.5x) + 0.5*x
+    """
+    return 0.5 * np.sin(3 * X) + 0.05 * (X**2) - np.cos(2.5 * X) + 0.5 * X
+
+# --------------------------
+# 2. Matern(ν=3/2)カーネル
+# --------------------------
+def matern32_kernel(X1, X2, length_scale=1.0, sigma_f=1.0):
+    """
+    Matern(ν=3/2)カーネルの定義
+      k(r) = sigma_f^2 * (1 + sqrt(3)*r/ell) * exp(- sqrt(3)*r/ell)
+    """
+    dists = cdist(X1, X2, metric='euclidean')  # X1, X2間のユークリッド距離行列
+    sqrt3 = np.sqrt(3.0)
+    factor = (sqrt3 * dists) / length_scale
+    K = sigma_f**2 * (1.0 + factor) * np.exp(-factor)
+    return K
+
+# --------------------------------------------
+# 3. 負の対数尤度 (Marginal Log-Likelihood)
+# --------------------------------------------
+def nll_fn(X_train, y_train, noise, length_scale_init, sigma_f_init):
+    """
+    ガウス過程の周辺対数尤度(Marginal Log-Likelihood)の負値を返す
+    θ = [log(length_scale), log(sigma_f)] を最適化
+    """
+    def nll(theta):
+        length_scale = np.exp(theta[0])
+        sigma_f      = np.exp(theta[1])
+
+        # カーネル行列 + ノイズ分 (対角)
+        K = matern32_kernel(X_train, X_train, length_scale, sigma_f) \
+            + noise**2 * np.eye(len(X_train))
+
+        # コレスキー分解
+        L = np.linalg.cholesky(K)
+
+        # (K^-1 y) を安定に計算
+        S = np.linalg.solve(L, y_train)
+
+        # 負の対数尤度 = 0.5 * y^T K^-1 y + 0.5 * log|K| + (定数)
+        # ここでは log|K| = 2 * sum(log(diag(L))) の形を利用
+        return 0.5 * np.dot(S, S) \
+               + np.sum(np.log(np.diagonal(L))) \
+               + 0.5 * len(X_train) * np.log(2.0 * np.pi)
+
+    return nll
+
+# ---------------------------------------
+# 4. ハイパーパラメータを最適化する関数
+# ---------------------------------------
+def optimize_hyperparameters(X_train, y_train, noise):
+    """
+    周辺対数尤度を最大化(負の対数尤度を最小化)するように
+    length_scale と sigma_f を最適化
+    初期値は log(1.0) = 0, 探索範囲は [-5,5]
+    """
+    nll = nll_fn(X_train, y_train, noise, length_scale_init=1.0, sigma_f_init=1.0)
+
+    # theta = [log(length_scale), log(sigma_f)] の初期値を [0, 0] とする
+    res = minimize(nll, x0=[0, 0],
+                   bounds=[(-5, 5), (-5, 5)],
+                   method='L-BFGS-B')
+
+    # 最適化後のlogパラメータをexpで戻す
+    length_scale_opt = np.exp(res.x[0])
+    sigma_f_opt      = np.exp(res.x[1])
+    return length_scale_opt, sigma_f_opt
+
+# -----------------------------
+# 5. データ生成 & 回帰実行
+# -----------------------------
+if __name__ == "__main__":
+    # 乱数シードを10に設定
+    np.random.seed(10)
+
+    # (1) トレーニングデータを生成
+    #    今回は [-4, 4] の範囲で 15点 をランダムサンプリング
+    X_train = np.random.uniform(-4, 4, 15).reshape(-1, 1)
+
+    # 真の関数 + 小さなノイズで y_train を生成(ノイズオフでもOK)
+    noise_true = 0.05  # 実際の観測ノイズ
+    y_train = true_function(X_train).ravel() \
+               + np.random.randn(len(X_train)) * noise_true
+
+    # (2) テストデータを生成
+    #    [-5, 5] の範囲を 120点 等間隔にとって予測
+    X_test = np.linspace(-5, 5, 120).reshape(-1, 1)
+
+    # (3) ガウス過程回帰の設定
+    #     ガウス過程モデルの「観測ノイズ標準偏差」は仮に 0.1 として推定
+    noise = 0.1
+
+    # (4) ハイパーパラメータを最適化
+    length_scale_opt, sigma_f_opt = optimize_hyperparameters(X_train, y_train, noise)
+    print(f"Optimized length_scale = {length_scale_opt}")
+    print(f"Optimized sigma_f      = {sigma_f_opt}")
+
+    # ---------------------------
+    # 6. カーネル行列の計算
+    # ---------------------------
+    K = matern32_kernel(X_train, X_train, length_scale_opt, sigma_f_opt) \
+        + noise**2 * np.eye(len(X_train))
+    K_s  = matern32_kernel(X_train, X_test, length_scale_opt, sigma_f_opt)
+    K_ss = matern32_kernel(X_test, X_test, length_scale_opt, sigma_f_opt)
+    K_inv = np.linalg.inv(K)
+
+    # ---------------------------
+    # 7. 予測の計算
+    # ---------------------------
+    # 予測平均
+    mu_s = K_s.T.dot(K_inv).dot(y_train)
+
+    # 予測共分散
+    cov_s = K_ss - K_s.T.dot(K_inv).dot(K_s)
+    sigma_s = np.sqrt(np.diag(cov_s))
+
+    # ---------------------------
+    # 8. 結果の可視化
+    # ---------------------------
+    plt.figure(figsize=(10, 6))
+
+    # トレーニングデータ
+    plt.plot(X_train, y_train, 'ro', label='Training data')
+
+    # 真の関数(ノイズなし)を描画
+    X_fine = np.linspace(-5, 5, 200).reshape(-1, 1)
+    plt.plot(X_fine, true_function(X_fine), 'g--', label='True function')
+
+    # GP予測平均
+    plt.plot(X_test, mu_s, 'b-', label='Prediction mean')
+
+    # 95%区間 (μ ± 1.96σ)
+    plt.fill_between(
+        X_test.ravel(),
+        mu_s - 1.96 * sigma_s,
+        mu_s + 1.96 * sigma_s,
+        alpha=0.2, color='blue', label='95% confidence'
+    )
+
+    plt.title("Gaussian Process Regression (Matern ν=3/2)")
+    plt.xlabel("x")
+    plt.ylabel("f(x)")
+    plt.legend(loc='upper left')
+    plt.show()
